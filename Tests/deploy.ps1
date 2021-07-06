@@ -1,31 +1,138 @@
-$Scripts = Get-ChildItem (Split-Path $PSScriptRoot -Parent) -Filter '*.ps1'
+## Define variables
+$fileShare = New-PSSession -ComputerName $Env:serverName
 
- if ($Scripts.count -gt 0) {
-     Describe 'PSScriptAnalyzer analysis' {
-        It "<Path> Should not violate: <IncludeRule>"`
-        -TestCases @(
-            Foreach ($script in $Scripts) {
-                Foreach ($rule in (Get-ScriptAnalyzerRule)) {
-                    @{
-                        IncludeRule = $rule.RuleName
-                        Path        = $script.FullName
-                    }
-                }
-            }
-        ) {
-            param($IncludeRule, $Path)
-            Invoke-ScriptAnalyzer -Path "$Path"`
-            -IncludeRule $IncludeRule |
-            Should -BeNullOrEmpty
-        }
-    }
+$stagingDir = $Env:stagingDirectory
+$cert = (Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert)
+
+$initParams = @{}
+## Uncomment the next line for debugging
+## $initParams.Add("Verbose", $true)
+
+## Set application properties
+$appName = $Env:APPVEYOR_PROJECT_NAME
+$appName = $appName -replace "_+"," " -replace "\-{2,}"," - " -replace "\b-+\b"," "
+$install = "Deploy-Application.exe -DeploymentType `"Install`" -AllowRebootPassThru"
+$uninstall = "Deploy-Application.exe -DeploymentType `"Uninstall`" -AllowRebootPassThru"
+
+## Determine the app's author
+switch ($Env:APPVEYOR_REPO_COMMIT_AUTHOR) {
+  $Env:jordanGitHub { $author = $Env:jordan }
+  $Env:quanGitHub { $author = $Env:quan }
+  $Env:steveGitHub { $author = $Env:steve }
+  $Env:truongGitHub { $author = $Env:truong }
+  $Env:jamesGitHub { $author = $Env:james }
+  $Env:davidGitHub { $author = $Env:david }
 }
+
+## Remove unneeded files from the repository before uploading to the file share
+Write-Output "Cleaning up Git and CI files..."
+Remove-Item -Path "$Env:APPLICATION_PATH\appveyor.yml"
+Remove-Item -Path "$Env:APPLICATION_PATH\deploy.ps1"
+Remove-Item -Path "$Env:APPLICATION_PATH\TestsResults.xml"
+Remove-Item -Path "$Env:APPLICATION_PATH\.DS_Store" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$Env:APPLICATION_PATH\.gitignore" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$Env:APPLICATION_PATH\.gitattributes" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$Env:APPLICATION_PATH\Tests" -Recurse
+Remove-Item -Path "$Env:APPLICATION_PATH\.git" -Recurse -Force
+
+## Sign PowerShell files to allow running the script directly with a RemoteSigned execution policy
+Get-ChildItem  "$Env:APPLICATION_PATH\AppDeployToolkit" `
+  | Where-Object { $_.Name -like "*.ps1" } `
+    | ForEach-Object `
+      { Set-AuthenticodeSignature $_.FullName $cert `
+        -HashAlgorithm SHA256 `
+        -TimestampServer "$Env:timestampServer" `
+      }
+
+Get-ChildItem  "$Env:APPLICATION_PATH" `
+  | Where-Object { $_.Name -like "Deploy-Application.ps1" } `
+    | ForEach-Object `
+      { Set-AuthenticodeSignature $_.FullName $cert `
+        -HashAlgorithm SHA256 `
+        -TimestampServer "$Env:timestampServer" `
+      }
+
+$contentLocation = "$Env:stagingContentLocation\$appName"
+
+## Remove previous staging toolkit files if detected, except for Files and SupportFiles
+Invoke-Command -Session $fileShare -ScriptBlock {
+  If (Test-Path -Path "$Using:stagingDir\$Using:appName" -PathType Container) {
+    Write-Output "Removing staging PowerShell App Deployment Toolkit..."
+    Remove-Item -Path "$Using:stagingDir\$Using:appName\*.*" -Force | Where-Object { ! $_.PSIsContainer }
+    Remove-Item -Path "$Using:stagingDir\$Using:appName\AppDeployToolkit" -Force -Recurse | `
+      Where-Object { $_.PSIsContainer }
+  } Else {
+    New-Item -Path $Using:stagingDir -Name $Using:appName -ItemType "directory"
+  }
+}
+
+## Upload the repository to the staging directory, overwriting any remaining files or support files
+Copy-Item -Path "$Env:APPLICATION_PATH\*" -Destination "$stagingDir\$appName\" -ToSession $fileShare -Force -Recurse
+
+## Set the application name as we want it to appear in Configuration Manager
+$appName = "Staging - $appName"
+
+## Import the ConfigurationManager.psd1 module
+If ($null -eq (Get-Module ConfigurationManager)) {
+  Import-Module "$($Env:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1" @initParams
+}
+
+## Connect to the site's drive if it is not already present
+If ($null -eq (Get-PSDrive -Name $Env:siteCode -PSProvider CMSite -ErrorAction SilentlyContinue)) {
+  New-PSDrive -Name $Env:siteCode -PSProvider CMSite -Root $Env:siteServer @initParams
+}
+
+## Set the active PSDrive to the ConfigMgr site code
+Set-Location "$($Env:siteCode):\" @initParams
+
+## Create the ConfigMgr application (if it doesn't exist) in the format "Staging - GitHub project name"
+## This also adds a link to the GitHub repository in the Administrator Comments field for reference and checks the box next to "Allow this application to be installed from the Install Application task sequence action without being deployed"
+## Reference: https://docs.microsoft.com/en-us/powershell/module/configurationmanager/new-cmapplication
+If ((Get-CMApplication -Name $appName -ErrorAction SilentlyContinue) `
+  -or (Get-CMApplication -Name "Staging - $Env:APPVEYOR_PROJECT_NAME" -ErrorAction SilentlyContinue)) {
+  
+    ## Rename an existing Staging application if detected
+  If (Get-CMApplication -Name "Staging - $Env:APPVEYOR_PROJECT_NAME" -ErrorAction SilentlyContinue) {
+    Get-CMApplication -Name "Staging - $Env:APPVEYOR_PROJECT_NAME" | Set-CMApplication -NewName $appName
+  }
+  ## Clear any existing owners and support contacts
+  Get-CMApplication -Name $appName | Set-CMApplication -ClearOwner -ClearSupportContact
+} Else {
+  New-CMApplication -Name $appName
+}
+
+Get-CMApplication -Name $appName | `
+  Set-CMApplication -Description "Repository: https://github.com/$Env:APPVEYOR_REPO_NAME" `
+    -ReleaseDate $(Get-Date -Format d) `
+    -Owner $author `
+    -SupportContact 'System Engineers' `
+    -AutoInstall $True
+
+## Create a new script deployment type with standard settings for PowerShell App Deployment Toolkit
+## You'll need to manually update the deployment type's detection method to find the software, make any other needed customizations to the application and deployment type, then distribute your content when ready.
+## Reference: https://docs.microsoft.com/en-us/powershell/module/configurationmanager/add-cmscriptdeploymenttype
+Get-CMApplication -Name $appName | `
+  Add-CMScriptDeploymentType -DeploymentTypeName `
+    "$appName $Env:APPVEYOR_BUILD_VERSION" `
+    -InstallCommand $install `
+    -ScriptLanguage "PowerShell" `
+    -ScriptText "Update this application's detection method to accurately locate the application." `
+    -ContentLocation $contentLocation `
+    -InstallationBehaviorType "InstallForSystem" `
+    -LogonRequirementType "WhetherOrNotUserLoggedOn" `
+    -MaximumRuntimeMins 120 `
+    -UserInteractionMode "Normal" `
+    -UninstallCommand $uninstall `
+    -ContentFallback `
+    -Comment "Commit: https://github.com/$Env:APPVEYOR_REPO_NAME/commit/$Env:APPVEYOR_REPO_COMMIT" `
+    -SlowNetworkDeploymentMode 'Download' `
+    -EnableBranchCache
 
 # SIG # Begin signature block
 # MIIf2QYJKoZIhvcNAQcCoIIfyjCCH8YCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCKmAODkOwGhXD4
-# 5Kr/8XssQYy0s8aQ/2cZsR6b6Oia0KCCGZwwggWuMIIElqADAgECAhAHA3HRD3la
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB6oChYwvc7Upk6
+# hQQkKj6RcnmEn2dIQfXEqsqx+q74j6CCGZwwggWuMIIElqADAgECAhAHA3HRD3la
 # QHGZK5QHYpviMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQswCQYDVQQI
 # EwJNSTESMBAGA1UEBxMJQW5uIEFyYm9yMRIwEAYDVQQKEwlJbnRlcm5ldDIxETAP
 # BgNVBAsTCEluQ29tbW9uMSUwIwYDVQQDExxJbkNvbW1vbiBSU0EgQ29kZSBTaWdu
@@ -167,29 +274,29 @@ $Scripts = Get-ChildItem (Split-Path $PSScriptRoot -Parent) -Filter '*.ps1'
 # CxMISW5Db21tb24xJTAjBgNVBAMTHEluQ29tbW9uIFJTQSBDb2RlIFNpZ25pbmcg
 # Q0ECEAcDcdEPeVpAcZkrlAdim+IwDQYJYIZIAWUDBAIBBQCggYQwGAYKKwYBBAGC
 # NwIBDDEKMAigAoAAoQKAADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgor
-# BgEEAYI3AgELMQ4wDAYKKwYBBAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQgGW09NkFY
-# b+Y2U3pe6i7yfgF38cqdpqOFbYTMu2Ck5rQwDQYJKoZIhvcNAQEBBQAEggEAufQS
-# vbM6a1neL3vX05MSMw6jjJgaHzn59XcufP6ECElnwsPMpzzz+pjgBZ87Oz4oEWEO
-# PPvnR5hEbnWftkO0Gk9dFCn/J83Zad8NSw/ybSGhzfbd2phZ2H1jTYRLeikLRIG7
-# l/pYaFR0HYXiLLTxvfwwKuf2S6YPuW05lL5wZCOpeEZ0wGAoEVpbBfcKE2lvvlH9
-# jT/FPRi0P72SPqra9pm7gtF9hsEZ0spQVqD6Sfo36jeHH9+bKXNLy0e2iIN7TOmc
-# 897jxFFnWfqVMKKQEDH/2PXaunbnuYBmevkn8/715WzCRbRVsjqvMG/3bYaXQfwd
-# jf4eJMlw6ifYpjl6gaGCA0wwggNIBgkqhkiG9w0BCQYxggM5MIIDNQIBATCBkjB9
+# BgEEAYI3AgELMQ4wDAYKKwYBBAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQgDHbx+ien
+# Ycat28ls6/8dYc2wKOvEcNBK2EWHDQmkcF0wDQYJKoZIhvcNAQEBBQAEggEABrRL
+# GMCp5qMo9C3YLo/K2ZGjuituZa4a0eXeZcII+C+oV36ITPxbrzJ6B1UYDsVMfoz3
+# LaINX/RrAVaktRtJyy5aDdCLU85NpC4uSMt90Nam87k1e+He2vpskRO6o+9BNxjc
+# F8I0PM/Qm1H4qjjbsfiMOoh0g+SAQfOiFS86buzTsd+Dzwhj6hvPGtaOEP7p+vY/
+# Gx4ZO8jABfI5V6ocKdHfAXAIZzY3EiSyPENTDXhMOIVFMRbSlYSgKS7sms+h75wO
+# MrqndJaHd9ChOMwdphYWy8QCZR0uo4YC/ImJtLN2+U9hhjcg2C+fe8kHXdXN/LFG
+# V+aZfjXVg9ByyTvq/qGCA0wwggNIBgkqhkiG9w0BCQYxggM5MIIDNQIBATCBkjB9
 # MQswCQYDVQQGEwJHQjEbMBkGA1UECBMSR3JlYXRlciBNYW5jaGVzdGVyMRAwDgYD
 # VQQHEwdTYWxmb3JkMRgwFgYDVQQKEw9TZWN0aWdvIExpbWl0ZWQxJTAjBgNVBAMT
 # HFNlY3RpZ28gUlNBIFRpbWUgU3RhbXBpbmcgQ0ECEQCMd6AAj/TRsMY9nzpIg41r
 # MA0GCWCGSAFlAwQCAgUAoHkwGAYJKoZIhvcNAQkDMQsGCSqGSIb3DQEHATAcBgkq
-# hkiG9w0BCQUxDxcNMjAxMjE3MTkwMDE2WjA/BgkqhkiG9w0BCQQxMgQwSUAqvTl+
-# cqmC4EsNa1eamFc2v2Kd/JPjVLe5xhkQdpisq7DsV8V+VFU2o9tubCaMMA0GCSqG
-# SIb3DQEBAQUABIICAIiU7fWe5FLgNdXOF9iPDZf91YihHifiIDrj8W9f0+tebMtn
-# L6X02UpjhQ0RQtzuYnRP/Ajd4iImD4RQ4tluFCYke5t2o3/jLgDRR4oWf4k7lr0D
-# LdDjRpNNsQJhHOBDGPH/hoZc9wXT3jTz0NGFBwGNlqKcHYV7ZU2zqjndUPUf2Cxp
-# 7TegXeDzovdFzwaJP/c7AlF+NmV5w2izw/5YJZOJRv1TbLGWM+sqF8FnTHMLU42f
-# QOugsYybznjNNlL4rwt2xxA/hAPeVwiZ4RCI81UEN3p5BEhufDIR55Kth1O8yn+H
-# 4K0tqHJtnUQLRQr0Irtzzym7TP5LDSx0iT9Ca1y6sJNfc6Q6rx6m8LpPxW0+l4ZK
-# ZeSAkFZdqhfTakKzn4uxUVIFR5+xd5xk/IQkDEW4tSAG0VuMcxwadlVBYYXeD+Qm
-# eJR2NTxo6RKpIpKYcTvuR0fWlFJp0sEHF0ii2pQLMiuBMtii0PA9lfSkwmbAf4Cn
-# taX9uN+5ZMpIXom0Fy3B5qu850/LCi1WekeJqg+vyuPj6hlbiRvbtgq02l6FbNVJ
-# loz27H7mP6LuSJ9l91bTCUMiqSRo0orPa2vMLAD4z1Qkh0Ymm6Batq3So9rAva81
-# sicUn95lHnlIXDT06tMXbB1ubRwyZX6hyMYNsVRVKx85qdr3fSRG+eNqExi+
+# hkiG9w0BCQUxDxcNMjAxMjE3MTkzNTM2WjA/BgkqhkiG9w0BCQQxMgQw+4vkgUSI
+# HTFAi5QK3IRVGFN5m4EP/P7/iNjunMK+j53hYD22IW3hv7eI+Wc8MMseMA0GCSqG
+# SIb3DQEBAQUABIICAIroed8WCkjYL0B1Lr32jh28OKdARjPrupG8yOO6YY6YcUKe
+# uLK0zP39deV8cpl/RtI80yZ0fe245in2KMpxLg2ttPc3MSziqQqePzd1ZbKEYxrO
+# B0Z7Ug1eVAzwpybXns/jmokdeKc5SKQc3gBBGN0RVsquwrEBOdrdzRbynbA0aRmU
+# kGt/hvs/0avoLkTEGRzgFfbf50BR+75uSsa5J5fpAhWY/CpLk8rOvjdPN0TfTNxQ
+# 1oRXhwUv3swC/yvP2NL1AJIAi+gkfnwDWHpZt5PJpOsxlL91IDHtKSSHhV3l9R7s
+# U0OvKPublEMxjm8S2vAMQ2A7cBYDtpZGRLe4DiBMGfQde/o2CMLD1P8WSlFNigBg
+# NthAHBpPcN8E20jnAR9s2C7eviDI9IkdQSpVK4zWynPMtzBl/FVQYRmMVF6FNBUA
+# ADgMLbcTCvYA193eSqxrUdQshDYfsLita9Ndpa5tBpCntzqDPZGly6DXDdj3+JLk
+# VEjw8bcGoltXwkeEM7zWmZV5fEyrIY2I+E5G2LQ4flSc0Bkh+Iye23KMLBqGLjaF
+# 7i8u+X9wmRsCZUa/86HPq39RAH13e50hvJkHnQB0yqD+6kL1lTWVVSuuKoS1PNRT
+# 4wk32IfHinHmEbnoM/+cWbn7SdwMnVLnwhQvxCLRvJ6dCK9tP8Z5PO348xEP
 # SIG # End signature block
